@@ -7,6 +7,12 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+  if (typeof pdfjsLib !== 'undefined') {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  }
+</script>
 <style>
   :root {
     --paper: #F5F2EB;
@@ -77,6 +83,7 @@
   .file-item-name { flex: 1; color: var(--ink); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .file-item-status { font-size: 11px; color: var(--olive); font-weight: 600; }
   .file-item-status.err { color: var(--rose); }
+  .file-item-status.pending { color: var(--copper); }
 
   .cta { display: block; width: 100%; padding: 16px; margin-top: 18px; background: var(--ink); color: white; border: none; border-radius: 12px; font-family: inherit; font-size: 16px; font-weight: 600; cursor: pointer; letter-spacing: -0.01em; }
   .cta:active { transform: scale(0.99); }
@@ -205,16 +212,16 @@
   </div>
 
   <div class="steps">
-    <div class="step"><div class="step-num">1</div><div class="step-text"><strong>Export</strong> 2-3 months of transactions from your bank as CSV. Look for "Download" or "Export" inside your account activity.</div></div>
+    <div class="step"><div class="step-num">1</div><div class="step-text"><strong>Download</strong> 2-3 months of statements from your bank. PDF or CSV both work — most banks let you download either.</div></div>
     <div class="step"><div class="step-num">2</div><div class="step-text"><strong>Upload</strong> the files below. They never leave your device.</div></div>
     <div class="step"><div class="step-num">3</div><div class="step-text"><strong>See</strong> your money picture: income, bills, leftover.</div></div>
   </div>
 
   <label class="upload-zone" id="uploadZone">
-    <input type="file" id="fileInput" accept=".csv,.txt" multiple />
+    <input type="file" id="fileInput" accept=".csv,.txt,.pdf" multiple />
     <div class="upload-icon">↑</div>
     <div class="primary">Tap to upload statements</div>
-    <div class="secondary">CSV files · 2-3 months recommended</div>
+    <div class="secondary">PDF or CSV files · 2-3 months recommended</div>
   </label>
 
   <div class="or-divider">or</div>
@@ -715,27 +722,135 @@ function analyzeTransactions(transactions) {
   return { income, bills, variable, months: monthsCovered };
 }
 
+// =============== PDF PARSER ===============
+async function parsePDF(file) {
+  if (typeof pdfjsLib === 'undefined') {
+    throw new Error('PDF reader not loaded. Check your connection and refresh.');
+  }
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+  // First pass: find statement year from header text
+  let statementYear = new Date().getFullYear();
+  let foundYear = false;
+  for (let p = 1; p <= Math.min(2, pdf.numPages); p++) {
+    const page = await pdf.getPage(p);
+    const content = await page.getTextContent();
+    const allText = content.items.map(i => i.str).join(' ');
+    // Look for "through MONTH DAY, YEAR" or "MONTH DAY, YEAR through"
+    const ymatch = allText.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](20\d{2})|\b(20\d{2})\b/);
+    if (ymatch) {
+      statementYear = parseInt(ymatch[3] || ymatch[4]);
+      foundYear = true;
+      break;
+    }
+  }
+
+  // Second pass: extract transactions line by line, all pages
+  const transactions = [];
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
+    const content = await page.getTextContent();
+
+    // Group text items by approximate y-coordinate to reconstruct visual lines
+    const lineMap = {};
+    for (const item of content.items) {
+      if (!item.str || !item.str.trim()) continue;
+      const y = Math.round(item.transform[5]);
+      if (!lineMap[y]) lineMap[y] = [];
+      lineMap[y].push({ x: item.transform[4], text: item.str });
+    }
+
+    // Sort y descending (PDF coordinates: 0 is bottom)
+    const sortedYs = Object.keys(lineMap).map(Number).sort((a, b) => b - a);
+    for (const y of sortedYs) {
+      // Sort items left to right
+      const items = lineMap[y].sort((a, b) => a.x - b.x);
+      const line = items.map(i => i.text).join(' ').replace(/\s+/g, ' ').trim();
+      if (!line) continue;
+      const tx = parseTransactionLine(line, statementYear);
+      if (tx) transactions.push(tx);
+    }
+  }
+
+  return transactions;
+}
+
+function parseTransactionLine(line, defaultYear) {
+  if (!line || line.length < 10) return null;
+  // Skip obvious non-transaction lines
+  if (/^(beginning balance|ending balance|total|subtotal|page \d|statement|account|customer|service)/i.test(line)) return null;
+
+  // Match date at start: MM/DD or MM/DD/YYYY or MM-DD-YYYY
+  const dateMatch = line.match(/^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);
+  if (!dateMatch) return null;
+
+  const month = parseInt(dateMatch[1]);
+  const day = parseInt(dateMatch[2]);
+  let year = dateMatch[3] ? parseInt(dateMatch[3]) : defaultYear;
+  if (year < 100) year += 2000;
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  if (year < 2000 || year > 2100) return null;
+
+  let rest = line.slice(dateMatch[0].length).trim();
+  if (!rest || rest.length < 3) return null;
+
+  // Pattern 1: "Description AMOUNT BALANCE" (Chase style)
+  // Both signed/unsigned, with commas
+  let m = rest.match(/^(.+?)\s+(-?\$?[\d,]+\.\d{2})\s+(-?\$?[\d,]+\.\d{2})\s*$/);
+  if (m) {
+    const desc = m[1].trim();
+    const amount = parseAmount(m[2]);
+    if (amount !== null && desc.length >= 2) {
+      return { date: new Date(year, month - 1, day), desc, amount };
+    }
+  }
+
+  // Pattern 2: "Description AMOUNT" (no balance shown)
+  m = rest.match(/^(.+?)\s+(-?\$?[\d,]+\.\d{2})\s*$/);
+  if (m) {
+    const desc = m[1].trim();
+    const amount = parseAmount(m[2]);
+    if (amount !== null && desc.length >= 2) {
+      return { date: new Date(year, month - 1, day), desc, amount };
+    }
+  }
+
+  return null;
+}
+
 // =============== FILE HANDLING ===============
-function handleFiles(files) {
+async function handleFiles(files) {
   for (const file of files) {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      try {
-        const text = e.target.result;
+    try {
+      let txs;
+      const isPDF = file.name.toLowerCase().endsWith('.pdf') || file.type === 'application/pdf';
+      if (isPDF) {
+        // Show in-progress state
+        state.files.push({ name: file.name, status: 'pending', count: 0 });
+        renderFileList();
+        txs = await parsePDF(file);
+        // Replace pending entry
+        const pendingIdx = state.files.findIndex(f => f.name === file.name && f.status === 'pending');
+        if (pendingIdx >= 0) state.files.splice(pendingIdx, 1);
+      } else {
+        const text = await file.text();
         const rows = parseGeneric(text);
         if (rows.length < 2) throw new Error('No data found');
         const cols = detectColumns(rows);
         if (!cols) throw new Error('Could not detect columns');
-        const txs = extractTransactions(cols);
-        if (txs.length === 0) throw new Error('No valid transactions');
-        state.rawTransactions.push(...txs);
-        state.files.push({ name: file.name, status: 'ok', count: txs.length });
-      } catch (err) {
-        state.files.push({ name: file.name, status: 'err', error: err.message });
+        txs = extractTransactions(cols);
       }
-      renderFileList();
-    };
-    reader.readAsText(file);
+      if (!txs || txs.length === 0) throw new Error('No transactions found');
+      state.rawTransactions.push(...txs);
+      state.files.push({ name: file.name, status: 'ok', count: txs.length });
+    } catch (err) {
+      // Clean up any pending entry
+      const pendingIdx = state.files.findIndex(f => f.name === file.name && f.status === 'pending');
+      if (pendingIdx >= 0) state.files.splice(pendingIdx, 1);
+      state.files.push({ name: file.name, status: 'err', error: err.message });
+    }
+    renderFileList();
   }
 }
 
@@ -765,13 +880,20 @@ function extractTransactions(cols) {
 
 function renderFileList() {
   const el = document.getElementById('fileList');
-  el.innerHTML = state.files.map(f => `
+  el.innerHTML = state.files.map(f => {
+    let statusText = '';
+    let statusCls = '';
+    if (f.status === 'ok') { statusText = f.count + ' txns'; }
+    else if (f.status === 'pending') { statusText = 'Reading…'; statusCls = 'pending'; }
+    else { statusText = 'Error'; statusCls = 'err'; }
+    return `
     <div class="file-item">
       <span class="file-item-icon">▤</span>
       <span class="file-item-name">${escapeHtml(f.name)}</span>
-      <span class="file-item-status ${f.status==='err'?'err':''}">${f.status === 'ok' ? f.count + ' txns' : 'Error'}</span>
+      <span class="file-item-status ${statusCls}">${statusText}</span>
     </div>
-  `).join('');
+  `;
+  }).join('');
   document.getElementById('analyzeBtn').disabled = state.rawTransactions.length === 0;
 }
 
